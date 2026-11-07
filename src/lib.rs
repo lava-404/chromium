@@ -1,70 +1,86 @@
-use std::collections::{HashMap, VecDeque};
-use axum::{routing::get, Router};
-enum Status {
-    Pending,
-    Running,
-    Completed
-}
-struct Job {
-  id: i32,
-  function_handler: String,
-  status: Status
-}
+use std::{collections::HashMap, future::Future, pin::Pin};
 
-enum RegisterationStatus {
-  Registered,
-  RegisterationFailure
-}
+use chrono::Utc;
+use serde_json::Value;
+use sqlx::{Pool, Postgres};
+use tokio::task;
+use uuid::Uuid;
 
+pub type JobHandler =
+    fn(Option<Value>) -> Pin<Box<dyn Future<Output = Option<Value>> + Send>>;
 
-impl Job<T> {
-    fn new(function_handler: String) -> Self {
-
-        Self {
-            id: 0,
-            function_handler,
-            status: Status::Pending
-        }
-        
-    }
+pub struct Chromium {
+    pub db_pool: Pool<Postgres>,
+    pub worker_pool: Vec<task::JoinHandle<()>>,
+    pub functions: HashMap<String, JobHandler>,
 }
 
-struct Chromium {
-  queue: VecDeque<Job>,
-  functions: HashMap<String, fn(Option<String>) -> (Option<String>)>
+#[derive(Debug, PartialEq, Eq)]
+pub enum RegistrationStatus {
+    Registered,
+    RegistrationFailure,
 }
-
 
 impl Chromium {
-  pub fn new() -> Self {
-    Self {
-      queue: VecDeque::new(),
-      functions: HashMap::new()
+    pub fn new(db_pool: Pool<Postgres>) -> Self {
+        Self {
+            db_pool,
+            worker_pool: Vec::new(),
+            functions: HashMap::new(),
+        }
     }
-  }
 
-  pub fn register(&mut self, function_handler: String, function: fn(Option<String>) -> Option<String>) -> () {
-    self.functions.insert(function_handler, function);
-  }
+    pub async fn register(
+        &mut self,
+        function_handler: String,
+        function: JobHandler,
+    ) -> RegistrationStatus {
+        let function_id = Uuid::new_v4();
+        let now = Utc::now();
 
-  pub fn enqueu()
+        let result = sqlx::query(
+            r#"
+            INSERT INTO functions (created_at, function_name, id)
+            VALUES ($1, $2, $3)
+            "#,
+        )
+        .bind(now)
+        .bind(&function_handler)
+        .bind(function_id)
+        .execute(&self.db_pool)
+        .await;
+
+        match result {
+            Ok(_) => {
+                self.functions.insert(function_handler, function);
+                RegistrationStatus::Registered
+            }
+            Err(e) => {
+                eprintln!("Registration failed: {e}");
+                RegistrationStatus::RegistrationFailure
+            }
+        }
+    }
+
+    pub async fn enqueue(
+        &mut self,
+        function_handler: String,
+        payload: Option<Value>,
+    ) {
+        let function = match self.functions.get(&function_handler) {
+            Some(function) => *function,
+            None => {
+                eprintln!("Handler not registered: {function_handler}");
+                return;
+            }
+        };
+
+        let handle = task::spawn(async move {
+            let result = function(payload).await;
+            println!("Job completed: {:?}", result);
+        });
+
+        self.worker_pool.push(handle);
+    }
 }
 
-
-
-#[tokio::main]
-async fn main() {
-    let queue  = VecDeque::new();
-    let app = Router::new()
-    .route("/enqueue", get(enqueue))
-    .route("/register",)
-
-    let listener = TcpListener::bind("127.0.0.1:3000").await.unwrap();
-    axum::serve(listener, app).await.unwrap();
-
-    println!("Hello, world!");
-}
-
-async fn enqueue(function_handler: String, payload: Option<String>) {
-
-}
